@@ -1,0 +1,12 @@
+# The adopter's filled-in config — never commit it (may hold project secrets).
+config.sh
+
+# Runtime artifacts the loop produces.
+*.partial
+*.partial.*
+.worktrees/
+tmp/agentic-devloop-last-suite.json
+
+# OS / editor cruft.
+.DS_Store
+*.swp

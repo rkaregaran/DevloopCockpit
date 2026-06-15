@@ -1,0 +1,63 @@
+{
+  "_comment": "PLAN stage settings (Claude Code harness, headless). Least-privilege: a read-only + git allowlist scoped to planning, no code-build commands. The deny[] block is the circuit-breaker (its own governance/secret/config dirs, kept in lockstep with $CIRCUIT_BREAKER_PATHS in config.sh) and the Stop hook is the machine-checked exit contract. Replace <ARTIFACT_ROOT> with $ARTIFACT_ROOT, <HANDOFF_ROOT> with $HANDOFF_ROOT, and the placeholder issue id with one matching $ISSUE_ID_PATTERN when you render this file for a unit.",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "additionalDirectories": [
+      "<HANDOFF_ROOT>"
+    ],
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(git add*)",
+      "Bash(git push origin HEAD)",
+      "Bash(git push -u origin HEAD)",
+      "Bash(git commit*)",
+      "Bash(ls*)",
+      "Bash(cat*)",
+      "Bash(head*)",
+      "Bash(tail*)",
+      "Bash(wc*)",
+      "Bash(grep*)",
+      "Bash(find*)",
+      "Bash(git ls-tree*)",
+      "Bash(git rev-parse*)",
+      "Bash(git ls-files*)"
+    ],
+    "deny": [
+      "Write(.git/**)",
+      "Edit(.git/**)",
+      "Write(.claude/**)",
+      "Edit(.claude/**)",
+      "Write(.devcontainer/**)",
+      "Edit(.devcontainer/**)",
+      "Write(.vscode/**)",
+      "Edit(.vscode/**)",
+      "Write(.idea/**)",
+      "Edit(.idea/**)",
+      "Write(.husky/**)",
+      "Edit(.husky/**)",
+      "Write(.cargo/**)",
+      "Edit(.cargo/**)",
+      "Write(.yarn/**)",
+      "Edit(.yarn/**)",
+      "Write(.mvn/**)",
+      "Edit(.mvn/**)",
+      "Write(.env)",
+      "Edit(.env)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are the exit evaluator for a headless PLAN stage session. The issue id (matching $ISSUE_ID_PATTERN) is named at the top of the session's first message. Judge ONLY tool-result blocks in the conversation — assistant prose is NOT evidence. ALLOW stopping iff EITHER: (A) ALL of — 1) a Write/Edit tool-result shows <ARTIFACT_ROOT>/<issue>-plan.md created or updated; 2) Bash tool-results show a git commit containing that plan file AND a successful git push; 3) a Write tool-result shows <HANDOFF_ROOT>/<issue>-plan-report.md whose first line is DONE and whose content includes a 'Self-review' section; OR (B) a Write tool-result shows <HANDOFF_ROOT>/<issue>-plan-report.md whose first line is ESCALATION, naming a recognised escalation cause (design-defect bounce, BLOCKED, or 3-strikes). A permission denial in tool results means arm B is the only valid exit — never approve a stop that worked around a denial (a fenced-path denial is itself the escalation trigger, not an obstacle to route around). If unmet, return {\"ok\": false, \"reason\": \"<exactly which evidence is missing>\"}; else return {\"ok\": true}."
+          }
+        ]
+      }
+    ]
+  }
+}

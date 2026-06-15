@@ -1,0 +1,52 @@
+# {Project} — Domain Glossary (CONTEXT.md)
+
+The canonical language of this project. Terms here are the ground truth: if code or a
+spec uses a word differently, the code/spec is wrong, not this file. Glossary only — no
+implementation details and no decisions (those live in `docs/adr/`).
+
+*Started {YYYY-MM-DD}. Grow it during grilling — see "How to grow this" at the bottom.*
+
+---
+
+## Language
+
+One heading per concept. State what the term **is**, not what it does. Pick the single
+best word for each concept and list every rejected synonym under `_Avoid_`, so reviewers
+and agents converge on one vocabulary instead of drifting across near-synonyms.
+
+### {Term}
+
+A {one-to-two-sentence definition of what the term is}. Note any entity it belongs to or
+is distinct from, so the boundary is unambiguous.
+_Avoid_: {synonym}, {synonym}
+
+<!-- ──────────────────────────────────────────────────────────────────────────
+WORKED EXAMPLE (neutral — delete once you have real terms)
+
+### Order
+
+A customer's request to purchase one or more items, captured at checkout. Distinct from
+an **Invoice**: an Order records intent to buy; an Invoice is the later request for
+payment against fulfilled work.
+_Avoid_: Purchase, transaction, cart
+
+────────────────────────────────────────────────────────────────────────── -->
+
+---
+
+## How to grow this
+
+- **Lazily, during grilling.** When a fuzzy or overloaded term surfaces while
+  stress-testing a plan, pin its single canonical word here the moment the decision
+  crystallises — not in a later documentation pass.
+- **One concept, one word.** When several words name the same thing, choose one and
+  push the rest to `_Avoid_`. When one word names several things, split it into distinct
+  terms.
+- **Keep definitions tight.** One or two sentences. Define what it IS; cross-reference
+  the entities it relates to or is distinct from.
+- **Domain terms only.** Concepts unique to this project belong; general programming
+  vocabulary (timeouts, retries, error types) does not, even if used heavily.
+- **Group with subheadings** when natural clusters emerge; a flat list is fine when all
+  terms belong to one cohesive area.
+- **Multiple bounded contexts?** Add a `CONTEXT-MAP.md` at the repo root listing each
+  context, where its `CONTEXT.md` lives, and how the contexts relate.

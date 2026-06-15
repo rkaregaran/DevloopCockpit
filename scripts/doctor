@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# scripts/doctor — read-only cockpit readiness check (developer onboarding).
+#
+# Prints ✓/✗ per prerequisite with an exact, copy-pasteable remediation; exits
+# non-zero if any REQUIRED check fails. This script is STRICTLY READ-ONLY: it
+# mutates nothing in the repo, your git config, your ssh config, or the cockpit
+# scaffolding — it only probes and prints. (The companion `onboard` script is the
+# one that mutates, then exec's this for a final verification pass.)
+#
+# Caveat on read-only-ness: a few external CLIs may write their OWN private state
+# when probed (e.g. `gh auth status` can refresh gh's device-id telemetry). That is
+# the tool's own cache, not this repo or your dotfiles — doctor itself writes nothing
+# except a throwaway $TMPDIR temp file it deletes before exit.
+#
+# Every project-specific value (paths, signing key, container detection) is read
+# from config.sh. Porting to another stack/host is an edit to config.sh, not here.
+set -uo pipefail   # NOT -e: doctor must continue past failing checks to report them all.
+
+# ── Resolve + source the config seam (skill ROOT, one level up from scripts/) ─
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
+if [[ -f "$ROOT_DIR/config.sh" ]]; then
+  # shellcheck disable=SC1091
+  . "$ROOT_DIR/config.sh"
+elif [[ -f "$ROOT_DIR/config.template.sh" ]]; then
+  echo "doctor: config.sh not found — falling back to config.template.sh defaults." >&2
+  echo "        Copy config.template.sh → config.sh and fill it in for your project." >&2
+  # shellcheck disable=SC1091
+  . "$ROOT_DIR/config.template.sh"
+else
+  echo "doctor: no config.sh / config.template.sh at skill root ($ROOT_DIR) — cannot run." >&2
+  exit 78
+fi
+
+# config.template.sh sets `set -euo pipefail`; restore doctor's continue-on-fail mode.
+set +e
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# Allow env overrides for testability; otherwise take the config values.
+HANDOFF_ROOT="${HANDOFF_ROOT:-$HOME/.agentic-devloop/handoffs}"
+AUTOMATION_SIGNING_KEY="${AUTOMATION_SIGNING_KEY:-}"
+
+# ── Pure helpers (inlined so doctor is self-contained — no other file required) ──
+# Terminal colors — suppressed when stdout is not a tty or NO_COLOR is set.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=''; C_BAD=''; C_DIM=''; C_OFF=''
+fi
+
+# status_line <ok|fail> <label> [remedy]
+#   ok   -> "✓ <label>"
+#   fail -> "✗ <label>" then, if a remedy is given, an indented "↳ <remedy>"
+status_line() {
+  local state="$1" label="$2" remedy="${3:-}"
+  if [[ "$state" == "ok" ]]; then
+    printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$label"
+  else
+    printf '%s✗%s %s\n' "$C_BAD" "$C_OFF" "$label"
+    [[ -n "$remedy" ]] && printf '    %s↳ %s%s\n' "$C_DIM" "$remedy" "$C_OFF"
+  fi
+}
+
+# pubkey_body <pubfile> — echo the base64 blob (field 2) of an SSH .pub file.
+pubkey_body() {
+  local f="${1:-}"
+  [[ -f "$f" ]] || return 1
+  awk '{ print $2; exit }' "$f"
+}
+
+# key_registered <pubfile> <registered-list-file>
+#   registered-list-file: newline-separated registered signing keys, each a full
+#   SSH pubkey string ("ssh-ed25519 AAAA..."). Returns 0 iff the pubfile's blob
+#   matches field 2 of any line; 1 if absent/list-missing; 2 on bad input. awk
+#   strips CR so a stray CRLF line ending can't silently false-negative.
+key_registered() {
+  local pubfile="${1:-}" listfile="${2:-}"
+  local body; body="$(pubkey_body "$pubfile")" || return 2
+  [[ -n "$body" ]] || return 2
+  [[ -f "$listfile" ]] || return 1
+  awk -v want="$body" '{ gsub(/\r/, "") } $2 == want { found = 1; exit } END { exit(found ? 0 : 1) }' "$listfile"
+}
+
+# in_container — true (0) inside the devcontainer / any Docker container.
+# /.dockerenv exists in every Docker container; REMOTE_CONTAINERS (VS Code) and
+# DEVCONTAINER are belt-and-suspenders. $DOCKERENV overrides the marker path purely
+# for hermetic tests. Pure: reads only a filesystem marker + env, mutates nothing.
+# (Harness/OS note: this predicate is Docker/VS-Code-specific — adjust for other hosts.)
+in_container() {
+  [[ -f "${DOCKERENV:-/.dockerenv}" ]] && return 0
+  [[ -n "${REMOTE_CONTAINERS:-}" ]] && return 0
+  [[ -n "${DEVCONTAINER:-}" ]] && return 0
+  return 1
+}
+
+# ── Check accounting ──────────────────────────────────────────────────────────
+FAILED=0
+ok()   { status_line ok   "$1"; }
+bad()  { status_line fail "$1" "$2"; FAILED=$((FAILED + 1)); }
+# skip: an advisory line that does NOT count as a failure — used when a check can't
+# be evaluated because of an *already-counted* upstream failure (e.g. the VCS CLI is
+# unauthenticated), so a single root cause isn't penalized twice.
+skip() { printf '%s•%s %s\n' "${C_DIM}" "${C_OFF}" "$1"; }
+
+# Pull the configured verification-profile commands into checkable tokens. We probe
+# the FIRST word of each command (the executable); if a profile command is empty,
+# the corresponding check is skipped rather than failed.
+first_word() { printf '%s' "${1%% *}"; }
+
+# ── Toolchain (verification-profile executables must be on PATH) ───────────────
+echo "── Toolchain ─────────────────────────────"
+check_cmd_on_path() {
+  # check_cmd_on_path <label> <command-string> <remedy>
+  local label="$1" cmdstr="$2" remedy="$3" exe
+  if [[ -z "$cmdstr" ]]; then
+    skip "$label — not configured (empty in config.sh)"
+    return
+  fi
+  exe="$(first_word "$cmdstr")"
+  if command -v "$exe" >/dev/null 2>&1; then
+    ok "$label ($exe)"
+  else
+    bad "$label" "$remedy"
+  fi
+}
+check_cmd_on_path "Test runner"        "${TEST_CMD:-}"        "Install your project toolchain, then: ${TEST_CMD:-<TEST_CMD>}"
+check_cmd_on_path "System-test runner" "${SYSTEM_TEST_CMD:-}" "Install your project toolchain, then: ${SYSTEM_TEST_CMD:-<SYSTEM_TEST_CMD>}"
+check_cmd_on_path "Linter"             "${LINT_CMD:-}"        "Install your linter, then: ${LINT_CMD:-<LINT_CMD>}"
+check_cmd_on_path "Security scanner"   "${SECURITY_CMD:-}"    "Install your scanner, then: ${SECURITY_CMD:-<SECURITY_CMD>}"
+
+# ── Dependencies installed (deterministic: derive from the migrate/setup command) ─
+# The migrate command's executable being present is a cheap proxy for "deps resolved".
+echo "── Dependencies ──────────────────────────"
+if [[ -n "${MIGRATE_CMD:-}" ]]; then
+  mig_exe="$(first_word "${MIGRATE_CMD}")"
+  if command -v "$mig_exe" >/dev/null 2>&1; then
+    ok "Project runner present ($mig_exe)"
+  else
+    bad "Project dependencies installed" "Run your project's setup/install, then: $mig_exe"
+  fi
+else
+  skip "Dependencies — no migrate/setup command configured"
+fi
+
+# ── Identity & signing ────────────────────────────────────────────────────────
+echo "── Identity & signing ────────────────────"
+if in_container; then
+  skip "Personal commit signing — host-only (the cockpit signs on the host)"
+  skip "Automation signing key — host-only"
+  skip "Automation key registered on $VCS_HOST — host-only"
+else
+  sign_on="$(git -C "$ROOT" config --get commit.gpgsign 2>/dev/null || true)"
+  sign_key="$(git -C "$ROOT" config --get user.signingkey 2>/dev/null || true)"
+  if [[ "$sign_on" == "true" && -n "$sign_key" ]]; then
+    ok "Personal commit signing configured"
+  else
+    bad "Personal commit signing" "Run: $HERE/onboard   # configures repo-local SSH signing"
+  fi
+
+  if [[ -z "$AUTOMATION_SIGNING_KEY" ]]; then
+    skip "Automation signing key — disabled (AUTOMATION_SIGNING_KEY empty in config.sh)"
+    skip "Automation key registered on $VCS_HOST — signing disabled"
+  else
+    if [[ -f "$AUTOMATION_SIGNING_KEY" && -f "$AUTOMATION_SIGNING_KEY.pub" ]]; then
+      ok "Automation signing key on disk"
+    else
+      bad "Automation signing key ($AUTOMATION_SIGNING_KEY)" \
+          "Run: $HERE/onboard   # generates the no-passphrase automation key"
+    fi
+
+    # Cross-check the automation key is registered with the VCS host for signing.
+    # Concrete adapter: GitHub via the `gh` CLI. Swap this block for your host.
+    if [[ "$VCS_HOST" == "github" ]] && command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      reg="$(mktemp)"; trap 'rm -f "${reg:-}"' EXIT
+      gh api user/ssh_signing_keys --jq '.[].key' > "$reg" 2>/dev/null || true
+      if [[ -f "$AUTOMATION_SIGNING_KEY.pub" ]] && key_registered "$AUTOMATION_SIGNING_KEY.pub" "$reg"; then
+        ok "Automation key registered on $VCS_HOST (signing)"
+      else
+        bad "Automation key registered on $VCS_HOST" \
+            "Run: $HERE/onboard   # gh ssh-key add --type signing"
+      fi
+      rm -f "$reg"; trap - EXIT
+    else
+      # The host CLI isn't authed — the CLIs section counts that once; don't double-penalize.
+      skip "$VCS_HOST signing-key check — deferred until the host CLI is authenticated (see CLIs)"
+    fi
+  fi
+fi
+
+# ── CLIs (host-only; cockpit orchestration runs on the host) ──────────────────
+echo "── CLIs ──────────────────────────────────"
+if in_container; then
+  skip "$VCS_HOST CLI authenticated — host-only"
+  skip "Agent CLI on PATH — host-only"
+else
+  # Concrete VCS-host adapter: GitHub `gh`. Swap for your host's CLI.
+  if [[ "$VCS_HOST" == "github" ]]; then
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      ok "$VCS_HOST CLI authenticated (gh)"
+    else
+      bad "$VCS_HOST CLI authenticated" "Install the gh CLI, then: gh auth login"
+    fi
+  else
+    skip "$VCS_HOST CLI — no concrete adapter for this host (extend doctor)"
+  fi
+  # The agent harness CLI must be installed for the cockpit to spawn stage sessions.
+  if command -v claude >/dev/null 2>&1; then
+    ok "Agent CLI on PATH"
+  else
+    bad "Agent CLI on PATH" "Install the agent harness CLI, then sign in"
+  fi
+fi
+
+# ── Cockpit scaffolding (durable handoff root + per-stage settings) ───────────
+echo "── Cockpit scaffolding ───────────────────"
+if in_container; then
+  skip "Handoff root — host-only"
+  skip "Stage settings — host-only"
+else
+  if [[ -d "$HANDOFF_ROOT" && -w "$HANDOFF_ROOT" ]]; then
+    ok "Handoff root ready ($HANDOFF_ROOT)"
+  else
+    bad "Handoff root ($HANDOFF_ROOT)" "mkdir -p \"$HANDOFF_ROOT\""
+  fi
+
+  # Per-stage harness settings ship with the bundle under scripts/stage-settings/.
+  missing_settings=0
+  for s in plan execute review; do
+    [[ -f "$HERE/stage-settings/$s.settings.json" ]] || missing_settings=1
+  done
+  if [[ "$missing_settings" -eq 0 ]]; then
+    ok "Stage settings present (plan/execute/review)"
+  else
+    bad "Stage settings (scripts/stage-settings/*.settings.json)" \
+        "Restore the skill bundle's scripts/stage-settings/ directory"
+  fi
+fi
+
+# ── Verdict ───────────────────────────────────────────────────────────────────
+echo
+if [[ "$FAILED" -eq 0 ]]; then
+  status_line ok "All required checks passed — cockpit ready."
+  exit 0
+else
+  printf '%s%d required check(s) failed.%s Fix the ↳ items above, or run: %s/onboard\n' \
+    "${C_BAD}" "$FAILED" "${C_OFF}" "$HERE"
+  exit 1
+fi

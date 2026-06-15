@@ -1,0 +1,71 @@
+{
+  "_comment": "REVIEW stage settings (Claude Code harness, headless). Mostly read + run-tests with a minimal write surface (only the handoff report dir). The deny[] block is the circuit-breaker (its own governance/secret/config dirs, kept in lockstep with $CIRCUIT_BREAKER_PATHS in config.sh) and the Stop hook is the machine-checked exit contract. Replace <ARTIFACT_ROOT> with $ARTIFACT_ROOT, <HANDOFF_ROOT> with $HANDOFF_ROOT, and the placeholder issue id with one matching $ISSUE_ID_PATTERN when you render this file for a unit. Bash entries below are the Rails default verification profile (config.sh $TEST_CMD/$LINT_CMD/$SECURITY_CMD and the bundled test runner that emits $TEST_STAMP_PATH); swap them for your stack's commands.",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "additionalDirectories": [
+      "<HANDOFF_ROOT>"
+    ],
+    "deny": [
+      "Write(.git/**)",
+      "Edit(.git/**)",
+      "Write(.claude/**)",
+      "Edit(.claude/**)",
+      "Write(.devcontainer/**)",
+      "Edit(.devcontainer/**)",
+      "Write(.vscode/**)",
+      "Edit(.vscode/**)",
+      "Write(.idea/**)",
+      "Edit(.idea/**)",
+      "Write(.husky/**)",
+      "Edit(.husky/**)",
+      "Write(.cargo/**)",
+      "Edit(.cargo/**)",
+      "Write(.yarn/**)",
+      "Edit(.yarn/**)",
+      "Write(.mvn/**)",
+      "Edit(.mvn/**)",
+      "Write(.env)",
+      "Edit(.env)"
+    ],
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(bin/devloop-test*)",
+      "Bash(bin/rails test*)",
+      "Bash(bin/rubocop*)",
+      "Bash(bin/brakeman*)",
+      "Bash(gh run*)",
+      "Bash(gh pr create*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr checks*)",
+      "Bash(ls*)",
+      "Bash(git push origin HEAD)",
+      "Bash(git push -u origin HEAD)",
+      "Bash(cat*)",
+      "Bash(head*)",
+      "Bash(tail*)",
+      "Bash(wc*)",
+      "Bash(grep*)",
+      "Bash(find*)",
+      "Bash(git ls-tree*)",
+      "Bash(git rev-parse*)",
+      "Bash(git ls-files*)",
+      "Workflow",
+      "Skill"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are the exit evaluator for a REVIEW stage session. The issue id (matching $ISSUE_ID_PATTERN) is named at the top of the session's first message. Judge ONLY tool-result blocks — assistant prose is NOT evidence. ALLOW stopping iff EITHER: (A) ALL of — 1) tool-results show the review trio (or equivalent agent dispatches) returned a security verdict, a QA-against-acceptance verdict, and a usability/a11y verdict or an explicit N/A (no UI changes); 2) every high/critical finding shows an adversarial-verification (refuter) verdict, and no confirmed blocker is unresolved (severity-triage gate: block only on confirmed high/critical security, unmet acceptance scenarios, or a11y blockers; low/medium proceed with a logged fix-or-accept decision); 3) AFTER the PR is open, a Bash tool-result shows the PR-head pull_request CI run is GREEN via `gh pr checks <pr>` reporting all required checks success, re-polled until conclusive — a green pre-PR push-event run on the same SHA is NOT acceptable proof; 4) a Bash tool-result shows gh pr create output with a PR URL and a body containing the close keyword plus the issue id (e.g. 'Closes <issue>'); 5) a Write tool-result shows <HANDOFF_ROOT>/<issue>-review-report.md whose first line is DONE with the three verdicts + triage decisions + the PR URL; OR (B) a Write tool-result shows <HANDOFF_ROOT>/<issue>-review-report.md whose first line is ESCALATION naming a rework cause and the loop-back stage. A permission denial in tool results (a circuit-breaker fence on a non-cosmetic path) means arm B is the only valid exit — never work around a fence to fabricate a deliverable. If unmet, return {\"ok\": false, \"reason\": \"<exactly which evidence is missing>\"}; else return {\"ok\": true}."
+          }
+        ]
+      }
+    ]
+  }
+}

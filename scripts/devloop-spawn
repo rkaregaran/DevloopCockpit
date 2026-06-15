@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# devloop-spawn <ISSUE> <plan|execute|review> — launch a headless stage session.
+# Spawns each stage as a fresh DETACHED session that inherits nothing but the
+# committed worktree + a pointer-only handoff doc and a minted session id.
+# Proven recipe: detached headless run with a clean top-level identity (the parent
+# session's harness env is laundered so the child is not seen as a sub-session).
+
+# ── Resolve + source config (config.sh, else the committed template) ──────────
+# Scripts live in scripts/; the config seam lives at the skill ROOT (one level up).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
+if [ -f "$ROOT_DIR/config.sh" ]; then
+  . "$ROOT_DIR/config.sh"
+elif [ -f "$ROOT_DIR/config.template.sh" ]; then
+  echo "warning: config.sh not found; falling back to config.template.sh defaults" >&2
+  . "$ROOT_DIR/config.template.sh"
+else
+  echo "error: no config.sh / config.template.sh at skill root ($ROOT_DIR)" >&2
+  exit 78
+fi
+
+ISSUE="${1:?usage: devloop-spawn <ISSUE> <plan|execute|review>}"
+STAGE="${2:?usage: devloop-spawn <ISSUE> <plan|execute|review>}"
+case "$STAGE" in plan|execute|review) ;; *) echo "error: unknown stage '$STAGE'" >&2; exit 64 ;; esac
+
+# The issue id lands in filesystem paths and a branch-name segment — VALIDATE it
+# against the configured pattern BEFORE it is ever interpolated into a path.
+[[ "$ISSUE" =~ $ISSUE_ID_PATTERN ]] || {
+  echo "error: issue must match ISSUE_ID_PATTERN ($ISSUE_ID_PATTERN), got '$ISSUE'" >&2
+  exit 64
+}
+
+ROOT="$(git rev-parse --show-toplevel)"
+ISSUE_LC="$(printf '%s' "$ISSUE" | tr '[:upper:]' '[:lower:]')"
+
+# Route every path through the config roots. WORKTREE_ROOT may be repo-relative
+# (resolve under $ROOT) or absolute (use as-is). HANDOFF_ROOT / CHAIN_LOG_ROOT are
+# durable and live OUTSIDE the repo.
+case "$WORKTREE_ROOT" in
+  /*) WT="$WORKTREE_ROOT/$ISSUE_LC" ;;
+  *)  WT="$ROOT/$WORKTREE_ROOT/$ISSUE_LC" ;;
+esac
+HANDOFF="$HANDOFF_ROOT/$ISSUE-$STAGE.md"
+SETTINGS="$HERE/stage-settings/$STAGE.settings.json"
+SESSION_JSON="$HANDOFF_ROOT/$ISSUE-$STAGE-session.json"
+STDERR_LOG="$HANDOFF_ROOT/$ISSUE-$STAGE-stderr.log"
+CHAIN_LOG="$CHAIN_LOG_ROOT/$ISSUE-chain.log"
+
+mkdir -p "$HANDOFF_ROOT" "$CHAIN_LOG_ROOT"
+
+[ -d "$WT" ]       || { echo "error: worktree missing: $WT (run devloop-worktree first)" >&2; exit 66; }
+[ -f "$HANDOFF" ]  || { echo "error: handoff missing: $HANDOFF (run the handoff skill first)" >&2; exit 66; }
+[ -f "$SETTINGS" ] || { echo "error: stage settings missing: $SETTINGS" >&2; exit 66; }
+
+# HARNESS-SPECIFIC: the headless agent binary (Claude Code CLI). Override via env for tests.
+CLAUDE="${DEVLOOP_CLAUDE_BIN:-claude}"
+SID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+
+(
+  cd "$WT"
+  # HARNESS-SPECIFIC: env -u laundering of the parent harness identity so the child
+  # spawns as a clean TOP-LEVEL session (not tagged as a sub-session of the orchestrator).
+  env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION \
+    nohup "$CLAUDE" \
+    -p "$(cat "$HANDOFF")" \
+    --settings "$SETTINGS" \
+    --session-id "$SID" \
+    --output-format json \
+    > "$SESSION_JSON" 2> "$STDERR_LOG" &
+  # ^ HARNESS-SPECIFIC: claude -p (headless prompt), --session-id (minted id),
+  #   --settings (per-stage allowlist/fence), --output-format json (machine-readable).
+)
+
+# Append to the durable per-unit chain log atomically (.partial + mv) so a poller
+# reading the chain never catches a half-written line (TOCTOU partial-read guard).
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+LINE="$(printf '%s\t%s\t%s\t%s' "$TS" "$ISSUE" "$STAGE" "$SID")"
+TMP="$CHAIN_LOG.partial.$$"
+{ [ -f "$CHAIN_LOG" ] && cat "$CHAIN_LOG"; printf '%s\n' "$LINE"; } > "$TMP"
+mv -f "$TMP" "$CHAIN_LOG"
+
+echo "session-id: $SID"
+echo "session-json: $SESSION_JSON"

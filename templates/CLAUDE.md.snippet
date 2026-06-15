@@ -1,0 +1,99 @@
+<!--
+  Merge into your existing CLAUDE.md or AGENTS.md — do not create the other.
+  This is the always-loaded agent governance constitution for a repo running the
+  agentic-devloop. Paste these sections into whichever single agent-instructions
+  file your harness already loads; keep exactly one such file in the repo root.
+-->
+
+## Required: route every task through a capability before acting
+
+All work in this repo goes through the matching **agentic-devloop capability**, engaged
+*before any other action*. This is a hard rule, not a suggestion — the routing below is
+the contract. "Capability" names a methodology this bundle ships (see the skill's
+`reference/` files); it is not a literal tool name — invoke the workflow the row points to.
+
+| Task class | Capability to engage first | Where it lives |
+|------------|----------------------------|----------------|
+| Any creative work — new feature, doc, module, framing, or behaviour change | **Design exploration / grill-before-build** | `reference/02-design-grill.md` |
+| Multi-step task with a spec or requirements | **Plan authoring**, then **staged execution** (parallel for independent pieces) | `reference/01-staged-loop.md` |
+| Breaking a plan/PRD into independently buildable units | **Backlog decomposition** (tracer-bullet vertical slices) | `reference/06-backlog-decomposition.md` |
+| Any bug, unexpected output, or "why does this say X" | **Systematic debugging** (reproduce → minimise → fix → regression-test) | `reference/01-staged-loop.md` |
+| Any code or config written — even one shell line | **Test-driven development** (red → green → refactor) | `reference/01-staged-loop.md` |
+| Before claiming work done / before a commit / before a PR | **Verification before completion** (evidence, never assertion) | `reference/04-exit-contracts-fences.md` |
+| Reviewing changes or receiving review | **Adversarial review trio** (security ‖ acceptance ‖ usability) | `reference/05-review-trio.md` |
+| Isolating an experiment or starting a unit of work | **Worktree isolation** | `reference/07-spawn-machinery.md` |
+| Orchestrating an in-flight unit headlessly | **Cockpit / headless-stage orchestration** | `reference/03-cockpit-orchestration.md` |
+| Wrapping up a branch (merge / PR / cleanup) | **Branch wrap-up** | `reference/01-staged-loop.md` |
+| Writing or editing a skill | **Skill authoring** | the skill bundle's own conventions |
+
+**Always invoke. When in doubt, invoke.** If no row above fits cleanly, still open the
+staged-loop reference and pick the nearest capability rather than improvising — the default
+is *engage a capability*, never *skip the loop*. The instruction is literal: route here first,
+every time, including before asking the user a clarifying question.
+
+**User overrides still win.** If the user explicitly tells you to skip a capability for a
+specific request, do so — *for that request only*. A one-off override never relaxes the rule
+for the next task.
+
+## The loop, in one line
+
+One unit of work = one branch = one loop = one PR = one merge. The pipeline runs in full
+regardless of unit size — the ceremony is the point: pull → design-grill → stress-test →
+plan → TDD build → self-verify → security ‖ QA ‖ usability review → summary → **PR last** →
+merge. Parallelise *between* independent units; stay sequential *within* a coupled one.
+The unit is a demoable workflow grouping ordered steps — never a single leaf task, never a
+horizontal layer split. Full shape lives in `reference/01-staged-loop.md`.
+
+## Day-one architectural bet
+
+Adopt the one expensive-to-retrofit architectural decision on **day one**, fail-closed by
+construction. The canonical example is tenant isolation, but the *shape* is what transfers:
+
+- Raise (do not silently default) when the security-critical context is missing.
+- Force-set the security-critical attribute at the boundary; never trust the caller to pass it.
+- Return a uniform not-found for unauthorised resources — never leak existence.
+- Provide exactly **one** greppable escape hatch for the deliberate cross-cutting case, so an
+  auditor can find every bypass with a single search.
+
+Decide your repo's day-one bet here and state it explicitly. Retrofitting it later is the most
+expensive mistake this constitution exists to prevent.
+
+## Known ambiguities — surface, do not silently resolve
+
+Keep a living list of unresolved decisions in the repo. When a request touches one, **flag it
+and ask** rather than picking a side and moving on. Seed it with your own; the recurring
+classes to watch for:
+
+1. **Naming not yet ratified** — product/company/subsystem names still in flux. Do not invent
+   a canonical name; use the working term and flag the drift.
+2. **Conflicting source documents** with no declared base case (e.g. multiple models/specs and
+   no cover memo). Never quote a figure without naming its source file.
+3. **Versioned duplicates / "FIX-" files** with no changelog. Newest mtime is the likely
+   freshest, but confirm before citing.
+4. **Duplicate concepts** defined in two places that need a single owner.
+5. **Stale stack references** in older docs superseded by newer decisions — the newer artifact
+   wins; flag the contradiction.
+
+> Replace the items above with your repo's actual open questions as they accrue. The discipline
+> is the deliverable: *surface, don't silently work around.*
+
+## Source precedence
+
+When two documents disagree, resolve by this order — and name the winning file when you cite:
+
+1. **Architecture Decision Records** (`docs/adr/…`) — the hard-to-reverse, ratified choices.
+2. **The current planning corpus / approved specs** — the active design of record.
+3. **The canonical glossary** (`CONTEXT.md` or equivalent) — what the words mean.
+4. **Point-in-time source material** (earlier drafts, imported strategy docs) — *input, not
+   ground truth.* Treat as evidence to weigh, not as a decision.
+
+Tune these paths to your repo. The rule that does not change: a ratified decision overrides a
+draft, and you must say which file you trusted.
+
+## Durable cross-session memory
+
+Record non-obvious, hard-won lessons as durable memory notes that survive a session reset.
+Each note states **what** was learned, **why** it bit, and **how to apply** the fix next time —
+with a staleness warning if the lesson is tied to a tool/version that may change. Treat this
+constitution and the dev-loop process docs as a living **contract**: keep them in lockstep with
+the scripts they govern, and amend the doc in the same change that alters the behaviour.

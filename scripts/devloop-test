@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# devloop-test — run the full verification suite and emit the deterministic JSON
+# stamp at $TEST_STAMP_PATH. That stamp is the trust anchor a stage's exit
+# contract checks (its mtime must be NEWER than HEAD): tool-result evidence the
+# suite actually ran, which assistant prose cannot fabricate.
+#
+# The stamp is written ATOMICALLY (.partial + mv) so a poller that waits on it
+# never reads a half-written file.
+set -uo pipefail
+
+# Capture env overrides BEFORE sourcing config: config assigns these
+# unconditionally, so we snapshot any caller-supplied values first and reapply
+# them afterward. (Everything stays env-overridable for testability.)
+ENV_TEST_CMD="${DEVLOOP_TEST_CMD:-}"
+ENV_STAMP_PATH="${DEVLOOP_TEST_STAMP_PATH:-}"
+
+# ── Resolve + source the project config seam (skill ROOT, one level up) ───────
+# config.sh is the adopter's filled-in copy; fall back to the shipped template.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
+if [ -f "$ROOT_DIR/config.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$ROOT_DIR/config.sh"
+elif [ -f "$ROOT_DIR/config.template.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$ROOT_DIR/config.template.sh"
+else
+  echo "error: no config.sh / config.template.sh at skill root ($ROOT_DIR)" >&2
+  exit 78
+fi
+# The config sets `set -e`; a failing suite is the EXPECTED case we must stamp,
+# not abort on. Re-assert our own option set after sourcing.
+set +e
+set -uo pipefail
+
+# Command + stamp path are config-driven, with env overrides winning (testability).
+CMD="${ENV_TEST_CMD:-${TEST_CMD:-bin/rails test}}"
+STAMP="${ENV_STAMP_PATH:-${TEST_STAMP_PATH:-tmp/agentic-devloop-last-suite.json}}"
+
+# ── Run the suite, capturing combined output (stamp is parsed from it) ────────
+OUTPUT="$(eval "$CMD" 2>&1)"
+EXIT=$?
+printf '%s\n' "$OUTPUT"
+
+# Portable count extraction: no GNU-specific tooling. Pull the LAST "<N> <word>"
+# occurrence from the suite output (the summary line) and isolate the integer;
+# emit JSON null when the runner does not print that word.
+last_count() {
+  printf '%s\n' "$OUTPUT" | grep -oE "[0-9]+ $1" | tail -1 | grep -oE '^[0-9]+' || echo null
+}
+# "examples" = total test cases run; Minitest prints "runs", RSpec "examples".
+EXAMPLES="$(last_count runs)"
+[ "$EXAMPLES" = "null" ] && EXAMPLES="$(last_count examples)"
+FAILURES="$(last_count failures)"
+ERRORS="$(last_count errors)"
+
+ESCAPED_CMD="$(printf '%s' "$CMD" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# ── Write the stamp atomically: render to .partial, then mv into place ────────
+STAMP_DIR="$(dirname "$STAMP")"
+mkdir -p "$STAMP_DIR"
+PARTIAL="${STAMP}.partial"
+cat > "$PARTIAL" <<JSON
+{"exit_code": $EXIT, "examples": $EXAMPLES, "failures": $FAILURES, "errors": $ERRORS, "finished_at": "$FINISHED_AT", "command": "$ESCAPED_CMD"}
+JSON
+mv -f "$PARTIAL" "$STAMP"
+
+exit $EXIT

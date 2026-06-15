@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# devloop-worktree ISSUE BRANCH — create an isolated per-unit worktree with
+# worktree-LOCAL non-interactive commit signing, so unattended stage sessions
+# commit signed without an interactive prompt and the human's main checkout is
+# left untouched.
+#
+# The signing config below is set with `git config --worktree` (worktree-local),
+# never globally. The local gpg.ssh.program=ssh-keygen override is the load-bearing
+# bit: it defeats a credential manager that hijacks gpg.ssh.program globally.
+#   GOTCHA to re-check per credential manager: 1Password's op-ssh-sign installs
+#   itself as the global gpg.ssh.program; setting it LOCALLY to ssh-keygen routes
+#   this worktree's commits around it. Audit the equivalent hijack for whatever
+#   ssh-agent / signing helper the adopter runs.
+
+# ── Resolve + source config (config.sh, else the committed template) ──────────
+# Scripts live in scripts/; the config seam lives at the skill ROOT (one level up).
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
+if [ -f "$ROOT_DIR/config.sh" ]; then
+  . "$ROOT_DIR/config.sh"
+elif [ -f "$ROOT_DIR/config.template.sh" ]; then
+  echo "warning: config.sh not found; falling back to config.template.sh defaults" >&2
+  . "$ROOT_DIR/config.template.sh"
+else
+  echo "error: no config.sh / config.template.sh at skill root ($ROOT_DIR)" >&2
+  exit 78
+fi
+
+ISSUE="${1:?usage: devloop-worktree ISSUE BRANCH}"
+BRANCH="${2:?usage: devloop-worktree ISSUE BRANCH}"
+
+# The issue id lands in filesystem paths — validate against the configured
+# pattern BEFORE it is ever interpolated into a path or branch name.
+[[ "$ISSUE" =~ $ISSUE_ID_PATTERN ]] || {
+  echo "error: issue id '$ISSUE' does not match ISSUE_ID_PATTERN ($ISSUE_ID_PATTERN)" >&2
+  exit 64
+}
+
+ROOT="$(git rev-parse --show-toplevel)"
+ISSUE_LC="$(printf '%s' "$ISSUE" | tr '[:upper:]' '[:lower:]')"
+
+# WORKTREE_ROOT may be relative (resolve against repo root) or absolute.
+case "$WORKTREE_ROOT" in
+  /*) WT_BASE="$WORKTREE_ROOT" ;;
+  *)  WT_BASE="$ROOT/$WORKTREE_ROOT" ;;
+esac
+WT="$WT_BASE/$ISSUE_LC"
+
+SIGNING_KEY="${AUTOMATION_SIGNING_KEY:-}"
+
+if [ -e "$WT" ]; then echo "error: $WT already exists" >&2; exit 65; fi
+if [ -n "$SIGNING_KEY" ] && [ ! -f "$SIGNING_KEY" ]; then
+  echo "error: automation signing key missing: $SIGNING_KEY (generate it, or set AUTOMATION_SIGNING_KEY=\"\" to disable signing)" >&2
+  exit 66
+fi
+
+mkdir -p "$WT_BASE"
+
+git -C "$ROOT" config extensions.worktreeConfig true
+if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  git -C "$ROOT" worktree add "$WT" "$BRANCH"
+else
+  git -C "$ROOT" worktree add -b "$BRANCH" "$WT" "${DEVLOOP_BASE_REF:-origin/main}"
+fi
+
+# Worktree-LOCAL signing: unattended commits sign without a prompt, the main
+# checkout's signing config is untouched. Skipped cleanly when signing is disabled.
+if [ -n "$SIGNING_KEY" ]; then
+  git -C "$WT" config --worktree gpg.format ssh
+  git -C "$WT" config --worktree gpg.ssh.program ssh-keygen
+  git -C "$WT" config --worktree user.signingkey "$SIGNING_KEY"
+  git -C "$WT" config --worktree commit.gpgsign true
+fi
+
+# Prepare the worktree for the configured stack by running MIGRATE_CMD (schema
+# prep / migrations). Skipped when MIGRATE_CMD is empty; override-able via
+# DEVLOOP_SKIP_SETUP for tests / faster spawns.
+if [ -z "${DEVLOOP_SKIP_SETUP:-}" ] && [ -n "${MIGRATE_CMD:-}" ]; then
+  (cd "$WT" && eval "$MIGRATE_CMD")
+fi
+
+echo "$WT"

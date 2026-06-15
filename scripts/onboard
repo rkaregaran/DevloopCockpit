@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# onboard — one-command developer setup for the cockpit (mutating).
+#
+# Idempotent: every step detects "already satisfied" and skips. It MUTATES the
+# environment (installs toolchain, generates + registers signing keys, creates
+# scaffolding dirs) and then exec's the read-only `doctor` for a final pass/fail
+# readout. Anything `onboard` provisions, `doctor` re-verifies without touching it.
+#
+# Everything project-specific is read from config.sh (the one seam). Everything
+# else is env-overridable for testability. Container-aware: host-only steps are
+# skipped inside the devcontainer (the image / compose services provide them).
+#
+# Flags:
+#   --dry-run     print actions, change nothing (skips the final doctor)
+#   --print-only  don't mutate the VCS host; print the commands instead
+#
+# This script is self-contained: the small pure helpers it shares with `doctor`
+# are inlined below so it can be dropped into a new repo and run as-is.
+set -uo pipefail   # NOT -e: we report and continue rather than abort mid-setup.
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# config.sh lives one level up (the skill root). Fall back to the template if the
+# adopter hasn't copied it yet — and say so loudly.
+if [[ -f "$HERE/../config.sh" ]]; then
+  # shellcheck disable=SC1091
+  . "$HERE/../config.sh"
+elif [[ -f "$HERE/../config.template.sh" ]]; then
+  echo "WARNING: config.sh not found — sourcing config.template.sh defaults." >&2
+  echo "         Copy config.template.sh to config.sh and edit it for this project." >&2
+  # shellcheck disable=SC1091
+  . "$HERE/../config.template.sh"
+else
+  echo "FATAL: no config.sh or config.template.sh next to the skill scripts." >&2
+  exit 70
+fi
+
+ROOT="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT"
+
+# ── Inlined pure helpers (shared contract with doctor) ───────────────────────
+# Terminal colors — suppressed when stdout is not a tty or NO_COLOR is set.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=''; C_BAD=''; C_DIM=''; C_OFF=''
+fi
+
+# pubkey_body <pubfile> — echo the base64 blob (field 2) of an SSH .pub file.
+# `${1:-}` so a missing arg returns 1 rather than crashing a `set -u` caller.
+pubkey_body() {
+  local f="${1:-}"
+  [[ -f "$f" ]] || return 1
+  awk '{ print $2; exit }' "$f"
+}
+
+# key_registered <pubfile> <registered-list-file>
+#   registered-list-file: newline-separated registered signing keys, each a full
+#   SSH pubkey string ("ssh-ed25519 AAAA..."). Returns 0 iff the pubfile's blob
+#   matches field 2 of any line; 1 if absent/list-missing; 2 on bad input.
+#   The list awk strips CR so a stray CRLF line ending can't false-negative.
+key_registered() {
+  local pubfile="${1:-}" listfile="${2:-}"
+  local body; body="$(pubkey_body "$pubfile")" || return 2
+  [[ -n "$body" ]] || return 2
+  [[ -f "$listfile" ]] || return 1
+  awk -v want="$body" '{ gsub(/\r/, "") } $2 == want { found = 1; exit } END { exit(found ? 0 : 1) }' "$listfile"
+}
+
+# in_container — true (0) when running inside a devcontainer / any Docker container.
+# /.dockerenv exists in every Docker container; REMOTE_CONTAINERS (VS Code) and
+# DEVCONTAINER are belt-and-suspenders for terminals that don't expose /.dockerenv.
+# The /.dockerenv path is overridable via $DOCKERENV purely for hermetic tests.
+# Pure: reads only a filesystem marker + env, mutates nothing.
+in_container() {
+  [[ -f "${DOCKERENV:-/.dockerenv}" ]] && return 0
+  [[ -n "${REMOTE_CONTAINERS:-}" ]] && return 0
+  [[ -n "${DEVCONTAINER:-}" ]] && return 0
+  return 1
+}
+
+# ── Flags ────────────────────────────────────────────────────────────────────
+DRY_RUN=0; PRINT_ONLY=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run)    DRY_RUN=1 ;;
+    --print-only) PRINT_ONLY=1 ;;
+    -h|--help)    echo "usage: onboard [--dry-run] [--print-only]"; exit 0 ;;
+    *) echo "unknown flag: $a" >&2; exit 64 ;;
+  esac
+done
+
+# ── Config-driven knobs (every value env-overridable; defaults Rails-shaped) ──
+# Durable, OUTSIDE-the-repo scaffolding root for handoffs etc. (config seam).
+HANDOFF_ROOT="${HANDOFF_ROOT:-$HOME/.agentic-devloop/handoffs}"
+# Unattended-commit signing identity (config seam; "" disables signing).
+AUTOMATION_SIGNING_KEY="${AUTOMATION_SIGNING_KEY:-$HOME/.ssh/automation_signing}"
+# Dedicated personal signing key, only minted if no SSH global signer exists.
+PERSONAL_SIGNING_KEY="${PERSONAL_SIGNING_KEY:-$HOME/.ssh/personal_signing}"
+
+# Verification-profile commands (config seam: TEST_CMD/MIGRATE_CMD/… live in config.sh).
+# Setup is the only verification-profile command `onboard` runs — it provisions deps and
+# prepares the databases in one shot; the rest (test/lint/migrate) are exercised by stages,
+# not setup. Default below is Rails; override in config.sh.
+SETUP_CMD="${SETUP_CMD:-bin/setup --skip-server}"
+
+# Toolchain probes — how setup decides "already satisfied". All overridable so a
+# non-Rails port routes its language/runtime/db/deps checks through config.sh.
+#   RUNTIME_NAME / RUNTIME_VERSION   — pin a language runtime (empty NAME = skip)
+#   RUNTIME_VERSION_CMD              — prints the active runtime version to compare
+#   RUNTIME_INSTALL_CMD              — install the pinned runtime (e.g. version mgr)
+#   RUNTIME_MANAGER_PKG             — package providing the version manager (brew)
+#   DB_READY_CMD                     — exit 0 iff the dev database is reachable
+#   DB_INSTALL_CMD / DB_START_CMD    — provision + start the database
+#   DEPS_CHECK_CMD                   — exit 0 iff dependencies are already installed
+#   SHARED_SECRET_PATH               — repo-relative path to a non-scriptable secret
+#                                      (empty = no shared-secret check; Rails default
+#                                      would be the credentials master key path)
+RUNTIME_NAME="${RUNTIME_NAME:-Ruby}"
+RUNTIME_VERSION="${RUNTIME_VERSION:-4.0.5}"
+# NB: this is expanded unquoted (word-split) below, so every token — including the
+# inline program passed to -e — must be space-free. `print(RUBY_VERSION)` is one token.
+RUNTIME_VERSION_CMD="${RUNTIME_VERSION_CMD:-ruby -eprint(RUBY_VERSION)}"
+RUNTIME_INSTALL_CMD="${RUNTIME_INSTALL_CMD:-asdf install}"
+RUNTIME_MANAGER_PKG="${RUNTIME_MANAGER_PKG:-asdf}"
+RUNTIME_MANAGER_BIN="${RUNTIME_MANAGER_BIN:-asdf}"
+DB_READY_CMD="${DB_READY_CMD:-pg_isready -q}"
+DB_READY_PROBE="${DB_READY_PROBE:-pg_isready}"
+DB_INSTALL_CMD="${DB_INSTALL_CMD:-brew install postgresql@16}"
+DB_START_CMD="${DB_START_CMD:-brew services start postgresql@16}"
+DEPS_CHECK_CMD="${DEPS_CHECK_CMD:-bundle check}"
+SHARED_SECRET_PATH="${SHARED_SECRET_PATH:-}"   # set in config.sh; empty = skip the check
+SHARED_SECRET_HINT="${SHARED_SECRET_HINT:-Get it from your team secret store / a teammate}"
+
+# Package-installer the host-step remedies assume (macOS Homebrew default).
+PKG_INSTALL="${PKG_INSTALL:-brew install}"
+PKG_BIN="${PKG_BIN:-brew}"
+
+# VCS-host CLI (concrete: GitHub `gh`). Override for a different host.
+VCS_CLI="${VCS_CLI:-gh}"
+# Agent harness CLI (Claude Code default).
+AGENT_CLI="${AGENT_CLI:-claude}"
+
+KEY_LABEL_HOST="$(hostname -s 2>/dev/null || echo host)"
+KEY_LABEL_USER="$(whoami 2>/dev/null || echo dev)"
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+say() { printf '\n%s== %s%s\n' "${C_DIM}" "$1" "${C_OFF}"; }
+
+# run <cmd...> — print the command, then execute it (skipped under --dry-run).
+run() {
+  printf '  $ %s\n' "$*"
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  "$@"
+}
+
+# register_signing_key <pubfile> <title> — idempotently register a signing key on
+# the VCS host. No-ops safely when the .pub is absent (dry-run) or already there.
+register_signing_key() {
+  local pub="$1" title="$2"
+  if ! command -v "$VCS_CLI" >/dev/null || ! "$VCS_CLI" auth status >/dev/null 2>&1; then
+    echo "  WARN $VCS_CLI not authenticated — cannot register $(basename "$pub") yet. After '$VCS_CLI auth login', re-run onboard."
+    return 0
+  fi
+  local reg; reg="$(mktemp)"; trap 'rm -f "${reg:-}"' RETURN
+  "$VCS_CLI" api user/ssh_signing_keys --jq '.[].key' > "$reg" 2>/dev/null || true
+  if [[ -f "$pub" ]] && key_registered "$pub" "$reg"; then
+    echo "  Already registered on the VCS host — skipping: $(basename "$pub")"
+    return 0
+  fi
+  if [[ "$PRINT_ONLY" == "1" ]]; then
+    echo "  (print-only) $VCS_CLI ssh-key add $pub --type signing --title \"$title\""
+    return 0
+  fi
+  run "$VCS_CLI" ssh-key add "$pub" --type signing --title "$title"
+}
+
+# ── Toolchain — language runtime ─────────────────────────────────────────────
+if [[ -n "$RUNTIME_NAME" ]]; then
+  say "Toolchain — $RUNTIME_NAME $RUNTIME_VERSION"
+  if in_container; then
+    echo "  In container — the runtime is provided by the image; skipping."
+  else
+    command -v "$RUNTIME_MANAGER_BIN" >/dev/null || run $PKG_INSTALL "$RUNTIME_MANAGER_PKG"
+    if [[ "$($RUNTIME_VERSION_CMD 2>/dev/null)" == "$RUNTIME_VERSION" ]]; then
+      echo "  $RUNTIME_NAME $RUNTIME_VERSION already active — skipping"
+    else
+      run $RUNTIME_INSTALL_CMD
+    fi
+  fi
+fi
+
+# ── Database ─────────────────────────────────────────────────────────────────
+say "Database"
+if in_container; then
+  echo "  In container — the database is provided by a compose service; skipping."
+elif command -v "$DB_READY_PROBE" >/dev/null && $DB_READY_CMD 2>/dev/null; then
+  echo "  Database already reachable — skipping"
+else
+  run $DB_INSTALL_CMD
+  run $DB_START_CMD
+fi
+
+# ── Dependencies + databases ─────────────────────────────────────────────────
+say "Dependencies + databases"
+if $DEPS_CHECK_CMD >/dev/null 2>&1; then
+  echo "  Dependencies satisfied — skipping"
+else
+  run $SETUP_CMD
+fi
+
+# ── Shared secret (non-scriptable) ───────────────────────────────────────────
+if [[ -n "$SHARED_SECRET_PATH" ]]; then
+  say "Shared secret — $SHARED_SECRET_PATH"
+  if [[ -f "$ROOT/$SHARED_SECRET_PATH" ]]; then
+    echo "  Present — skipping"
+  else
+    echo "  WARN MISSING — this is a shared secret and cannot be scripted."
+    echo "    $SHARED_SECRET_HINT → $SHARED_SECRET_PATH, then re-run."
+  fi
+fi
+
+# ── Personal commit signing ──────────────────────────────────────────────────
+# Reuse an existing global SSH signing key (incl. a credential-manager op-ssh-sign
+# setup, which sets gpg.format=ssh) — but ONLY when it is SSH-format. A global *GPG*
+# key must not be repurposed as an SSH signer, so fall through and set up a dedicated
+# repo-local SSH key instead. New keys are passphraseless by deliberate policy: disk
+# is protected by full-disk encryption + 0600 perms, and signing stays frictionless —
+# the same model as the automation key below.
+if in_container; then
+  say "Personal commit signing"
+  echo "  In container — commit signing is configured on the host; skipping."
+else
+  say "Personal commit signing"
+  existing_key="$(git config --global --get user.signingkey 2>/dev/null || true)"
+  existing_format="$(git config --global --get gpg.format 2>/dev/null || true)"
+  if [[ -n "$existing_key" && "$existing_format" == "ssh" ]]; then
+    echo "  Detected an existing global SSH signing key — reusing it, not clobbering."
+    echo "  Ensuring repo-local commit.gpgsign=true"
+    run git config --local commit.gpgsign true
+  else
+    [[ -z "$existing_key" ]] || echo "  A non-SSH (GPG) global signing key is set — leaving it alone and configuring a dedicated SSH key for this repo."
+    [[ -f "$PERSONAL_SIGNING_KEY" ]] || run ssh-keygen -t ed25519 -N "" -C "personal-${KEY_LABEL_USER}@${KEY_LABEL_HOST}" -f "$PERSONAL_SIGNING_KEY"
+    run git config --local gpg.format ssh
+    run git config --local user.signingkey "$PERSONAL_SIGNING_KEY"
+    run git config --local commit.gpgsign true
+    register_signing_key "$PERSONAL_SIGNING_KEY.pub" "personal-${KEY_LABEL_HOST}"
+  fi
+fi
+
+# ── Automation signing key (unattended stages) ───────────────────────────────
+# Passphraseless by necessity: the unattended cockpit stages can't answer a prompt.
+# Host-only — the cockpit signs on the host, not inside a container. Skipped entirely
+# when AUTOMATION_SIGNING_KEY is "" (signing disabled in config.sh).
+if [[ -z "$AUTOMATION_SIGNING_KEY" ]]; then
+  say "Automation signing key (unattended cockpit)"
+  echo "  Signing disabled in config (AUTOMATION_SIGNING_KEY is empty) — skipping."
+elif in_container; then
+  say "Automation signing key (unattended cockpit)"
+  echo "  In container — the automation key lives on the host; skipping."
+else
+  say "Automation signing key (unattended cockpit)"
+  if [[ -f "$AUTOMATION_SIGNING_KEY" ]]; then
+    echo "  Present — skipping generation"
+  else
+    run ssh-keygen -t ed25519 -N "" -C "automation-${KEY_LABEL_USER}@${KEY_LABEL_HOST}" -f "$AUTOMATION_SIGNING_KEY"
+  fi
+  # Called unconditionally — register_signing_key is idempotent and no-ops safely when
+  # the .pub doesn't exist yet (e.g. under --dry-run) or is already registered.
+  register_signing_key "$AUTOMATION_SIGNING_KEY.pub" "automation-${KEY_LABEL_HOST}"
+fi
+
+# ── Cockpit scaffolding — durable handoff root ───────────────────────────────
+say "Cockpit scaffolding — $HANDOFF_ROOT"
+run mkdir -p "$HANDOFF_ROOT"
+
+# ── CLIs — VCS host + agent harness ──────────────────────────────────────────
+say "CLIs — $VCS_CLI + $AGENT_CLI"
+command -v "$VCS_CLI" >/dev/null || run $PKG_INSTALL "$VCS_CLI"
+if command -v "$VCS_CLI" >/dev/null && ! "$VCS_CLI" auth status >/dev/null 2>&1; then
+  echo "  $VCS_CLI not authenticated — launching login (browser)."
+  run "$VCS_CLI" auth login
+fi
+command -v "$AGENT_CLI" >/dev/null || echo "  WARN $AGENT_CLI CLI not found. Install the agent harness, then run '$AGENT_CLI' to sign in."
+
+# ── Finish — hand off to the read-only doctor ────────────────────────────────
+say "Verifying readiness"
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "  (dry-run: skipping doctor)"
+  exit 0
+fi
+exec "$HERE/doctor"
