@@ -83,4 +83,4 @@ Distilled from a production dev loop and verified end-to-end by a dry-run (workt
 
 ## License
 
-No license file yet — add the one you want before relying on it elsewhere.
+MIT — see [LICENSE](LICENSE).
